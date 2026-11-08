@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import http from "node:http";
+import { createHash, timingSafeEqual } from "node:crypto";
 import type { ZodRawShape } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -287,6 +288,13 @@ async function main() {
   const port = Number(process.env.HTTP_PORT || process.env.PORT || 3000);
 
   if (httpMode) {
+    const secret = process.env.MCP_SECRET_TOKEN;
+    if (!secret || !/^[A-Za-z0-9\-._~+/]+=*$/.test(secret)) {
+      throw new Error("Set MCP_SECRET_TOKEN to a non-empty Bearer token before starting HTTP mode.");
+    }
+    // Compare fixed-length digests, including when the supplied token has a
+    // different length. Never reuse HH_ACCESS_TOKEN for inbound authentication.
+    const secretDigest = createHash("sha256").update(secret).digest();
     const host = process.env.HOST || "127.0.0.1";
     // DNS-rebinding protection (off by default in the SDK, CVE-2025-66414):
     // only accept requests whose Host header is in this allow-list.
@@ -311,6 +319,25 @@ async function main() {
       }
 
       if (url.pathname === "/mcp") {
+        // Authenticate every method before reading the body, creating an MCP
+        // server/transport, or returning protocol-specific responses.
+        const authorizationCount = req.rawHeaders.filter(
+          (value, index) => index % 2 === 0 && value.toLowerCase() === "authorization",
+        ).length;
+        const match = /^Bearer +([A-Za-z0-9\-._~+/]+=*)$/i.exec(req.headers.authorization || "");
+        if (
+          authorizationCount !== 1 ||
+          !match ||
+          !timingSafeEqual(createHash("sha256").update(match[1]).digest(), secretDigest)
+        ) {
+          res.writeHead(401, {
+            "Content-Type": "application/json",
+            "WWW-Authenticate": 'Bearer realm="hh-mcp"',
+            "Cache-Control": "no-store",
+          });
+          res.end(JSON.stringify({ error: "Unauthorized" }));
+          return;
+        }
         if (req.method !== "POST") {
           res.writeHead(405, { "Content-Type": "application/json", Allow: "POST" });
           res.end(
@@ -339,8 +366,9 @@ async function main() {
           await server.connect(transport);
           const body = await readJsonBody(req);
           await transport.handleRequest(req, res, body);
-        } catch (err) {
-          console.error("[hh-mcp] request error:", err);
+        } catch {
+          // Parser/SDK errors may contain attacker-controlled body fragments.
+          console.error("[hh-mcp] request failed");
           if (!res.headersSent) {
             res.writeHead(500, { "Content-Type": "application/json" });
             res.end(
