@@ -295,14 +295,17 @@ describe("references", () => {
 });
 
 describe("validate_token", () => {
-  it("reports public-only mode without a token", async () => {
+  it("probes anonymous search without promising permanent public access", async () => {
+    mockHhGet.mockResolvedValueOnce({ items: [] });
     const result = await handleValidateToken();
     expect(result).toContain("не задан");
-    expect(mockHhGet).not.toHaveBeenCalled();
+    expect(result).toContain("не гарантирован");
+    expect(mockHhGet).toHaveBeenCalledWith("/vacancies?per_page=1&page=0");
   });
 
   it("reports a valid token and role via /me", async () => {
     process.env.HH_ACCESS_TOKEN = "t";
+    mockHhGet.mockResolvedValueOnce({ items: [] });
     mockHhGet.mockResolvedValueOnce({
       id: "9",
       email: "hr@acme.io",
@@ -315,11 +318,26 @@ describe("validate_token", () => {
     expect(result).toContain("employer");
   });
 
-  it("reports an invalid token on 403", async () => {
+  it("uses HH's explicit error code to identify an invalid token", async () => {
     process.env.HH_ACCESS_TOKEN = "bad";
-    mockHhGet.mockRejectedValueOnce(new HhApiError(403, "Forbidden"));
+    mockHhGet.mockRejectedValueOnce(new HhApiError(403, "Forbidden", '{"errors":[{"type":"oauth","value":"bad_authorization"}]}'));
+    expect(await handleValidateToken()).toContain("invalid_hh_token");
+  });
+
+  it("accepts an application token for search without requiring a user /me", async () => {
+    process.env.HH_ACCESS_TOKEN = "application-token";
+    mockHhGet.mockResolvedValueOnce({ items: [] });
+    mockHhGet.mockRejectedValueOnce(new HhApiError(403, "Forbidden", '{"errors":[{"type":"oauth","value":"user_auth_expected"}]}'));
     const result = await handleValidateToken();
-    expect(result).toContain("недействителен");
+    expect(result).toContain("Поиск вакансий с HH_ACCESS_TOKEN успешно проверен");
+    expect(result).toContain("токена приложения");
+    expect(result).not.toContain("недействителен");
+  });
+
+  it("reports the actual Render search denial instead of inferring expiry from /me", async () => {
+    mockHhGet.mockRejectedValueOnce(new HhApiError(403, "Forbidden", '{"errors":[{"type":"forbidden"}],"request_id":"1794177364056354d42f87d2c9641008"}'));
+    const result = JSON.parse(await handleValidateToken());
+    expect(result).toMatchObject({ source: "hh_api", search_available: false, authorization: "anonymous", reason: "forbidden", http_status: 403 });
   });
 });
 

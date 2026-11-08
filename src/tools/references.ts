@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { hhDiagnostic, hhErrorDetails } from "../hh-errors.js";
 import { hhGet, HhApiError } from "../client.js";
 import type { Area } from "../types.js";
 import { flattenAreaTree } from "../format.js";
@@ -133,8 +134,20 @@ export const validateTokenSchema = z.object({
 export async function handleValidateToken(
   params: z.infer<typeof validateTokenSchema> = {},
 ): Promise<string> {
-  if (!process.env.HH_ACCESS_TOKEN) {
-    return "HH_ACCESS_TOKEN не задан. Доступны только публичные endpoint'ы (вакансии, работодатели, зарплаты, словари). Поиск резюме недоступен — нужен employer-токен.";
+  const hasToken = !!process.env.HH_ACCESS_TOKEN?.trim();
+  // Probe from the actual Render egress, not the user's browser or a different IP.
+  // No vacancy data or credentials are included in the diagnostic response.
+  try {
+    await hhGet("/vacancies?per_page=1&page=0");
+  } catch (error) {
+    if (error instanceof HhApiError) {
+      const diagnostic = hhDiagnostic(error.status, error.body, "/vacancies", hasToken);
+      return JSON.stringify({ search_available: false, ...diagnostic }, null, 2);
+    }
+    throw error;
+  }
+  if (!hasToken) {
+    return "HH_ACCESS_TOKEN не задан. Пробный поиск hh.ru сейчас прошёл без токена, но анонимный доступ не гарантирован: HH может потребовать капчу или вернуть 403. Для устойчивого серверного поиска задайте токен приложения HH. MCP OAuth проверяется отдельно.";
   }
   try {
     const me = (await hhGet("/me")) as MeProfile;
@@ -151,7 +164,10 @@ export async function handleValidateToken(
     return `Токен валиден. Пользователь: ${name}${me.email ? ` <${me.email}>` : ""}. Роли: ${roles}.\n${note}`;
   } catch (e) {
     if (e instanceof HhApiError && (e.status === 401 || e.status === 403)) {
-      return `Токен задан, но недействителен или истёк (HTTP ${e.status}). Получите новый OAuth-токен на https://dev.hh.ru/admin.`;
+      const details = hhErrorDetails(e.body);
+      const invalid = details.errors.some((error) => error.type === "oauth" && ["bad_authorization", "token_expired", "token_revoked", "application_not_found"].includes(error.value || ""));
+      if (invalid) return JSON.stringify(hhDiagnostic(e.status, e.body, "/me", true), null, 2);
+      return "Поиск вакансий с HH_ACCESS_TOKEN успешно проверен. /me не возвращает пользователя (HTTP " + e.status + "): это допустимо для токена приложения, которому пользовательский профиль не принадлежит. Такой ответ сам по себе не означает, что токен истёк. Для резюме нужен токен работодателя и оплаченный доступ.";
     }
     throw e;
   }

@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    branches: [main, security/self-hosted-oauth]
 
 jobs:
   build-and-test:
