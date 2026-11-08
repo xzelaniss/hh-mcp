@@ -76,20 +76,57 @@ claude mcp add hh -e HH_ACCESS_TOKEN=your-token -- npx -y @theyahia/hh-mcp
 ### Режим HTTP (Streamable HTTP)
 
 ```bash
-npx @theyahia/hh-mcp --http
+# Из этого репозитория, после npm ci && npm run build:
+# Сначала настройте защищённый режим и его переменные окружения (см. ниже).
+npm start -- --http
 # или
-HTTP_PORT=8080 npx @theyahia/hh-mcp --http
+HTTP_PORT=8080 npm start -- --http
 ```
 
 Эндпоинт: `http://localhost:3000/mcp` (POST) · Проверка состояния: `http://localhost:3000/health` (GET)
 
-HTTP-режим stateless, по умолчанию слушает `127.0.0.1` с включённой защитой от DNS-rebinding. Чтобы открыть его наружу, задайте `HOST=0.0.0.0`, добавьте свой host/origin в `HH_ALLOWED_HOSTS` / `HH_ALLOWED_ORIGINS` и поставьте перед ним собственную аутентификацию.
+HTTP-режим stateless, по умолчанию слушает `127.0.0.1` с защитой от DNS-rebinding.
+Требуется Node.js 22.12+ (для Render используйте 24). Доступны два защищённых режима:
+
+- `MCP_AUTH_MODE=bearer` (по умолчанию): отдельный `MCP_SECRET_TOKEN` в env,
+  клиент передаёт `Authorization: Bearer …`. Создайте секрет приватно командой
+  `openssl rand -hex 32`. Подходит клиентам с настройкой заголовков.
+- `MCP_AUTH_MODE=oauth`: совместимый с пользовательскими MCP ChatGPT OAuth через
+  собственную страницу входа владельца, PKCE S256, PostgreSQL и discovery. Статический
+  MCP_SECRET_TOKEN здесь не принимается. Отдельный шлюз не требуется; нужна
+  постоянная PostgreSQL (например, Neon Free), без провайдера входа.
+
+В обоих режимах проверка выполняется до чтения тела и обработки MCP. Запрос без
+правильного токена получает 401. Stdio не требует MCP-аутентификации. `GET /health`
+остаётся публичным. Не помещайте токены в URL, исходный код, чат или логи.
+`HH_ACCESS_TOKEN` нужен только для исходящих запросов к hh.ru и не заменяет MCP auth.
+Файл `.env.local` автоматически не загружается.
+
+Для внешнего доступа необходим HTTPS, `HOST=0.0.0.0` и реальный hostname в
+`HH_ALLOWED_HOSTS`. Развёртывание и слияние PR требуют отдельного решения владельца.
+
+### Подключение к ChatGPT и Render Free
+
+См. **[пошаговую инструкцию OAuth + Render + ChatGPT](docs/chatgpt-render.md)**:
+настройка владельца и PostgreSQL, точные Build/Start Commands, env, Health Check Path и поля формы
+«Добавить пользовательский сервер MCP». Выбирайте **OAuth** с заранее
+зарегистрированными Client ID/Secret, а не смешанный или анонимный режим.
+Реальное подключение требует настройки env/постоянной PostgreSQL и разрешённого развёртывания;
+вход через публичный ChatGPT пока не выполнен. SQL/HTTP и форма входа проверяются локально.
 
 ## Переменные окружения
 
 | Переменная | Обяз. | Описание |
 |----------|----------|-------------|
 | `HH_ACCESS_TOKEN` | нет | Bearer-токен OAuth 2.0. Нужен для эндпоинтов резюме (работодатель + оплаченная база резюме). |
+| `MCP_AUTH_MODE` | нет | `bearer` (по умолчанию) или `oauth`. Режима без защиты нет. |
+| `MCP_PUBLIC_URL` | в oauth | Канонический HTTPS origin сервиса, без `/mcp`. |
+| `MCP_OAUTH_CLIENT_ID` | в oauth | Единственный заранее зарегистрированный Client ID ChatGPT. |
+| `MCP_OAUTH_CLIENT_SECRET` | в oauth | Случайный секрет OAuth-клиента (генератор `npm run oauth:secrets`). |
+| `MCP_ADMIN_PASSWORD_HASH` | в oauth | Scrypt-хеш пароля единственного владельца. |
+| `MCP_OAUTH_REDIRECT_URIS` | в oauth | Точные HTTPS callback URI ChatGPT через запятую, без wildcard. |
+| `MCP_OAUTH_DATABASE_URL` | в oauth | Секретная строка подключения к постоянной PostgreSQL с TLS. |
+| `MCP_SECRET_TOKEN` | в bearer | Отдельный секрет входящего доступа к `/mcp`. Передаётся как `Authorization: Bearer …`. |
 | `HH_USER_AGENT` | нет | Свой `HH-User-Agent` (hh.ru его требует). Рекомендуемый формат: `your-app/1.0 (you@example.com)`. |
 | `HTTP_PORT` / `PORT` | нет | Порт HTTP-режима (по умолчанию 3000). |
 | `HOST` | нет | Интерфейс привязки в HTTP-режиме (по умолчанию `127.0.0.1`). |
