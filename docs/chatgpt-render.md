@@ -1,212 +1,258 @@
-# HeadHunter MCP → ChatGPT: OAuth и Render Free
+# Собственный OAuth для HeadHunter MCP: Render Free + PostgreSQL
 
-Подготовлено 8 ноября 2026 г. Этот документ не запускает развёртывание. PR нельзя
-сливать и Render нельзя запускать без отдельного подтверждения владельца.
+Инструкция проверена по документации 9 ноября 2026 г. Auth0 и другие провайдеры
+входа не используются. **Не сливать PR, не создавать публичный сервис и не
+переходить на платные планы без отдельного подтверждения владельца.**
 
-## Что реализовано
+## Что требуется и почему
 
-**ChatGPT → защищённый `/mcp` на Render**, вход и выдача токенов — **Auth0**.
-Отдельный OAuth-шлюз, база данных и хранение OAuth-сессий на Render не нужны.
-Это OAuth resource server, а не самодельный сервер выдачи токенов. Для работы
-нужен настроенный внешний Auth0 tenant; одних переменных Render недостаточно.
+Авторизация работает в самом Node.js-приложении:
 
-ChatGPT поддерживает Authorization Code + PKCE S256, discovery и заранее
-зарегистрированный OAuth client. Здесь выбран именно этот вариант; DCR/CIMD
-включать не требуется. Выбирайте **OAuth**, а не «без аутентификации» или смешанный
-режим. Все запросы `/mcp`, включая initialize и tools/list, защищены.
+`ChatGPT → OAuth-вход владельца на вашем Render → защищённый /mcp → hh.ru`
 
-Публичны только `/health` и документы discovery
-`/.well-known/oauth-protected-resource/mcp` (также доступен корневой вариант).
-Discovery содержит адреса и scopes, а не секреты и не данные hh.ru.
+Нужна постоянная PostgreSQL для одноразовых кодов, отзыва и ротации токенов,
+состояния входа и лимитов попыток. В памяти процесса эти данные не хранятся.
+SQLite/файлы на Render Free не подходят: Render удаляет их при перезапусках.
+Самодостаточного варианта только на одном Render Free с надёжным сохранением
+этого состояния данная реализация не предоставляет.
 
-На каждом MCP-запросе сервер проверяет RS256-подпись по ключам настроенного
-Auth0 tenant, точные issuer и audience, exp/iat/nbf, scope `mcp:tools`, OAuth client
-и разрешённый `sub`. Срок access token — не более 3600 секунд (допуск часов 5 секунд).
-Чужой аккаунт, даже зарегистрированный в том же Auth0, не получает доступа.
-Недействительный/отсутствующий токен даёт 401; чужой пользователь/клиент или
-недостаточный scope — 403. В OAuth-режиме нет обхода через MCP_SECRET_TOKEN.
+Простейшая бесплатная конфигурация — **Render Free Web Service + Neon Free
+PostgreSQL**. Neon используется только как база: его Auth/провайдеры входа не нужны.
+Можно использовать любую другую постоянную PostgreSQL с проверяемым TLS.
+Регистрация Neon из вашей страны здесь не проверена. Если она недоступна,
+понадобится другой доступный вам хостинг PostgreSQL; код не привязан к Neon.
 
-## 1. Подготовить адрес сервиса, не запуская его
+Никаких аккаунтов, БД или сервисов этой задачей не создаётся. Бесплатные планы
+имеют ограничения и могут приостанавливать обслуживание; постоянная доступность
+не гарантируется. При недоступности базы MCP отклоняет запрос, а не снимает защиту.
 
-Выберите будущий адрес, например `https://hh-mcp-ВАШЕ-ИМЯ.onrender.com`.
-Во всех следующих настройках замените пример на реальный адрес, который выделит
-Render. Если имя занято или адрес изменился, синхронно обновите Auth0 API Identifier,
-MCP_PUBLIC_URL и HH_ALLOWED_HOSTS. Адрес ниже — шаблон, не опубликованный сервер.
+## 1. Подготовить секреты на своём компьютере
 
-## 2. Настроить Auth0
+После просмотра PR скачайте/переключите ветку `security/self-hosted-oauth`.
+Нужен Node.js 22.12+; рекомендуется 24. В **своём приватном терминале**, не в чате,
+не в CI и не в командах сборки Render, выполните:
 
-Нужен аккаунт Auth0 и tenant. Используйте отдельный tenant для личного MCP,
-чтобы его настройки не влияли на другие приложения. Создание и настройка
-выполняются владельцем; реальные значения секретов не отправляйте в чат/GitHub.
+```sh
+npm ci
+npm run oauth:secrets
+```
 
-1. **Applications → APIs → Create API**:
-   - Name: `HeadHunter MCP`.
-   - Identifier: `https://ВАШ-СЕРВИС.onrender.com/mcp` — точно, без завершающего `/`.
-   - Signing Algorithm: **RS256**.
-   - Access Token Profile: **Auth0** (содержит `azp`).
-   - Token Expiration и Token Expiration for Browser Flows: **3600** секунд.
-   - Permissions: добавьте `mcp:tools`, описание «Использовать инструменты HeadHunter».
-   - Для обновления токенов включите **Allow Offline Access**.
-   - В этом рецепте оставьте API RBAC выключенным: право владельца независимо
-     проверяется по обязательному allowlist `sub`. Если включаете RBAC, отдельно
-     назначьте владельцу роль с разрешением `mcp:tools`.
-2. **Settings → Advanced → Settings**: включите
-   **Resource Parameter Compatibility Profile** и
-   **Include Issuer in Authorization Responses**. Первый связывает стандартный
-   параметр `resource` с audience, второй защищает OAuth callback от подмены issuer.
-   Не подменяйте это снятием проверки audience на MCP-сервере.
-3. **Applications → Applications → Create Application → Regular Web Applications**:
-   - Name: `ChatGPT HeadHunter MCP`.
-   - Сохраните **Client ID**; **Client Secret** понадобится только в форме ChatGPT.
-   - В **Advanced Settings → Grant Types** оставьте **Authorization Code** и
-     **Refresh Token**. Password, Implicit и Client Credentials для этого подключения
-     не нужны.
-   - Token Endpoint Authentication Method: **Post** (`client_secret_post`).
-   - Включите refresh token rotation, например с абсолютным сроком 30 дней и
-     сроком неактивности 7 дней; по истечении потребуется войти повторно.
-   - **Allowed Callback URLs**: при включённом issuer identification текущая
-     документация ChatGPT указывает
-     `https://chatgpt.com/connector_platform_oauth_redirect`.
-     При настройке соединения сверьте его с **точным redirect URI**, показанным
-     в управлении пользовательским MCP в ChatGPT, и добавьте именно этот URI.
-     Некоторые соединения используют `https://chatgpt.com/connector/oauth/{callback_id}`:
-     фигурные скобки не вставляйте, копируйте полный фактический адрес. Не используйте
-     wildcard и не угадывайте callback по старым инструкциям для GPT Actions.
-   - В Connections включите только выбранный способ входа.
-4. **User Management → Users**: создайте личного пользователя (это отдельная
-   учётная запись для входа в MCP, не обязательно ваш административный аккаунт Auth0).
-   Скопируйте его **User ID**, например `auth0|...`, в `MCP_OAUTH_ALLOWED_SUBJECTS`.
-   При социальной авторизации ID может начинаться с `google-oauth2|...`.
-   Отключите самостоятельную регистрацию в используемом database connection, если
-   она не нужна. Allowlist на сервере обязателен даже при отключённой регистрации.
-5. Проверьте `https://ВАШ-TENANT.auth0.com/.well-known/openid-configuration`:
-   - `issuer` должен точно совпадать с `MCP_OAUTH_ISSUER`, включая финальный `/`;
-   - должны быть authorization_endpoint, token_endpoint, jwks_uri;
-   - `code_challenge_methods_supported` должен содержать `S256`;
-   - `token_endpoint_auth_methods_supported` должен содержать `client_secret_post`;
-   - при включённом issuer identification проверьте
-     `authorization_response_iss_parameter_supported: true`.
-   Для Auth0 jwks_uri должен быть `https://ВАШ-TENANT.auth0.com/.well-known/jwks.json`.
+Команда создаст новые случайные значения:
 
-Сервер не получает OAuth Client Secret: он проверяет публичные ключи Auth0.
-Не нужно создавать секрет MCP для OAuth и не нужно передавать токены Auth0 в hh.ru.
+- **OWNER PASSWORD**: пароль единственного владельца. Сохраните в менеджере паролей.
+  Его потребуется вводить на странице OAuth-входа. В Render помещается только хеш,
+  сам пароль не отправляйте в чат/GitHub и не включайте в URL.
+- **MCP_ADMIN_PASSWORD_HASH**: scrypt-хеш с солью. Скопируйте в env Render целиком,
+  включая символы `$`. Это поле Render UI, а не shell-команда; не выполняйте его
+  через `source` или незакавыченное присваивание в shell.
+- **MCP_OAUTH_CLIENT_ID**: идентификатор единственного клиента, по умолчанию
+  `chatgpt-headhunter`. Это не секрет.
+- **MCP_OAUTH_CLIENT_SECRET**: отдельный случайный секрет клиента. Сохраните в
+  менеджере паролей, затем в Render и в форме OAuth ChatGPT.
 
-## 3. Точные настройки Render — применять только после подтверждения
+На публичном сайте нет регистрации, сброса пароля или открытого bootstrap-endpoint.
+Первоначальный владелец задаётся только через приватные env. Вход каждый раз требует
+пароль; постоянной браузерной административной сессии нет. Знание Client Secret
+само по себе не позволяет получить код: также нужны пароль владельца и PKCE.
 
-Не нажимайте создание/развёртывание сервиса во время согласования PR. Когда
-владелец отдельно разрешит публикацию, создайте **Web Service**:
+Если вывод нужно сохранить в файл, используйте приватную папку и права только
+владельцу; скрипт требует явного `--allow-private-output` для неинтерактивного вывода.
+Не коммитьте такой файл. Не запускайте генератор в окне с записью терминала.
 
-| Поле Render | Значение |
+## 2. Подготовить постоянную PostgreSQL
+
+После отдельного решения владельца создайте проект **Neon Free** либо выберите
+существующую постоянную PostgreSQL. Оставайтесь на бесплатном плане; перехода на
+платный тариф эта инструкция не требует.
+
+1. Создайте отдельную БД для этого MCP. Не включайте Neon Auth.
+2. Скопируйте PostgreSQL connection string из **Connect** (допустим pooled endpoint).
+3. Сохраните её как секретную переменную `MCP_OAUTH_DATABASE_URL` в Render.
+4. У пользователя БД должны быть права создавать таблицы и работать с ними в
+   выбранной схеме. При первом запуске приложение создаст таблицы `hh_oauth_*`.
+   Инициализация схемы сериализуется PostgreSQL advisory lock.
+
+Подключение всегда использует TLS с проверкой сертификата и имени сервера.
+Query-параметры connection string не используются: они не могут переопределить TLS,
+хост, пароль или тайм-ауты подключения.
+Не используйте `NODE_TLS_REJECT_UNAUTHORIZED=0` и не отключайте проверку TLS.
+Сроки и атомарность проверяются в PostgreSQL, включая блокировки строк транзакции.
+
+Данные БД должны сохраняться после сна/перезапуска Render и самой БД. Бесплатный
+Render Postgres, который истекает через 30 дней, не подходит для постоянного
+подключения без последующей миграции. Neon Free имеет квоты, но не удаляет данные
+просто из-за засыпания compute. Если тариф/условия изменились, проверьте их до создания.
+
+## 3. Настройки Render (применять только после разрешения публикации)
+
+| Поле | Значение |
 |---|---|
+| Type | Web Service |
 | Repository | `xzelaniss/hh-mcp` |
-| Branch | `security/mcp-bearer-auth` для согласованной проверки PR; `main` только после разрешённого слияния |
-| Language / Runtime | `Node` |
-| Instance Type | `Free` |
-| Root Directory | пусто (корень репозитория) |
+| Branch | `security/self-hosted-oauth` для разрешённой проверки этого PR |
+| Runtime | Node |
+| Instance Type | Free |
+| Root Directory | пусто |
 | Build Command | `npm ci --include=dev && npm run build` |
 | Start Command | `node dist/index.js --http` |
 | Health Check Path | `/health` |
 | Auto-Deploy | **Off / Disabled** |
 
-Environment Variables (значения с `ВАШ` заменить, кавычки в UI не нужны):
+Определите фактический адрес сервиса. Ниже `ВАШ-СЕРВИС.onrender.com` — шаблон,
+который нужно везде заменить на выделенный Render адрес.
 
-| Имя | Значение |
+| Environment Variable | Значение |
 |---|---|
 | `NODE_VERSION` | `24` |
 | `NODE_ENV` | `production` |
 | `HOST` | `0.0.0.0` |
 | `MCP_AUTH_MODE` | `oauth` |
 | `MCP_PUBLIC_URL` | `https://ВАШ-СЕРВИС.onrender.com` — только origin, без `/mcp` |
-| `MCP_OAUTH_ISSUER` | `https://ВАШ-TENANT.auth0.com/` — точный issuer с `/` |
-| `MCP_OAUTH_CLIENT_ID` | Client ID приложения `ChatGPT HeadHunter MCP` из Auth0 |
-| `MCP_OAUTH_ALLOWED_SUBJECTS` | ваш точный User ID из Auth0; при необходимости несколько через запятую |
-| `HH_ALLOWED_HOSTS` | `ВАШ-СЕРВИС.onrender.com` — без схемы и пути |
-| `HH_USER_AGENT` | своё имя приложения и контакт, например `my-hh-mcp/1.0 (me@example.com)` |
-| `HH_ACCESS_TOKEN` | необязательно: секретный OAuth-токен hh.ru, нужен для резюме и `/me` |
+| `MCP_OAUTH_DATABASE_URL` | секретная PostgreSQL connection string |
+| `MCP_ADMIN_PASSWORD_HASH` | полный scrypt-хеш из приватного генератора |
+| `MCP_OAUTH_CLIENT_ID` | `chatgpt-headhunter` либо ваш ID из генератора |
+| `MCP_OAUTH_CLIENT_SECRET` | случайный секрет из генератора |
+| `MCP_OAUTH_REDIRECT_URIS` | точный callback ChatGPT, см. следующий раздел |
+| `HH_ALLOWED_HOSTS` | `ВАШ-СЕРВИС.onrender.com` без схемы/пути |
+| `HH_USER_AGENT` | ваше имя приложения и контакт, например `my-hh-mcp/1.0 (me@example.com)` |
+| `HH_ACCESS_TOKEN` | необязательно: отдельный секрет hh.ru для закрытых возможностей |
 
-`PORT` предоставляет Render, не задавайте `HTTP_PORT`. `HH_ALLOWED_ORIGINS` можно
-не задавать: серверные запросы ChatGPT не требуют браузерного Origin. Если задаёте
-его, перечислите только реально используемые Origin. HTTPS завершает Render,
-приложение внутри слушает HTTP. Не отключайте проверку TLS к Auth0/hh.ru.
+`PORT` предоставляет Render. `HTTP_PORT` и `HH_ALLOWED_ORIGINS` обычно не задавайте.
+HTTPS завершается на Render; браузер видит HTTPS, приложение внутри слушает HTTP.
+Заголовок Origin проверяется по `MCP_PUBLIC_URL`, а не по Forwarded/Host.
+Файл `.env.local` автоматически не загружается.
 
-`MCP_SECRET_TOKEN` в этом рецепте не задаётся, в OAuth-режиме он не принимается.
-OAuth Client Secret хранится в ChatGPT, не в Render. HH_ACCESS_TOKEN хранится в
-секретных переменных Render и используется только для исходящих запросов hh.ru.
-Самостоятельная загрузка `.env.local` не реализована; Render передаёт env напрямую.
-
-Free Render засыпает после 15 минут без входящего трафика; запуск обычно занимает
-около минуты. Первый запрос ChatGPT может завершиться тайм-аутом. После разрешённого
-развёртывания откройте `/health`, дождитесь JSON и повторите подключение. Free-план
-имеет квоты и может перезапускаться; постоянно доступный сервис не гарантируется.
-OAuth-сессии/refresh tokens остаются у Auth0 и ChatGPT, а не на эфемерном диске Render.
-Доступность функций и квоты Auth0 зависят от выбранного tenant/тарифа; отдельный
-платный Render или PostgreSQL этому решению не требуется.
+Удалите старые `MCP_OAUTH_ISSUER`, `MCP_OAUTH_ALLOWED_SUBJECTS` из Auth0-рецепта.
+`MCP_SECRET_TOKEN` в режиме OAuth не принимается. Сохраняемый отдельный режим
+`MCP_AUTH_MODE=bearer` предназначен другим клиентам; он не нужен для ChatGPT.
 
 ## 4. Поля «Добавить пользовательский сервер MCP» в ChatGPT
 
-После отдельно разрешённого развёртывания:
+Реализация соответствует документированному варианту **заранее зарегистрированного
+OAuth-клиента**: Authorization Code + PKCE S256, discovery RFC 8414/9728,
+`resource` и issuer identification RFC 9207. Открытая динамическая регистрация
+DCR и CIMD не требуются и не включены. MCP-инструменты не доступны анонимно.
 
-| Поле ChatGPT | Что заполнить |
+| Поле ChatGPT | Значение |
 |---|---|
 | Название | `HeadHunter` |
-| Описание | `Поиск вакансий, работодателей и справочники HeadHunter` |
-| URL сервера MCP | `https://ВАШ-СЕРВИС.onrender.com/mcp` |
-| Аутентификация | **OAuth** |
-| OAuth Client ID | Client ID приложения Auth0, тот же что `MCP_OAUTH_CLIENT_ID` |
-| OAuth Client Secret | Client Secret этого приложения Auth0 |
+| Описание | `Мой защищённый MCP для HeadHunter` |
+| Server URL | `https://ВАШ-СЕРВИС.onrender.com/mcp` |
+| Authentication | **OAuth** |
+| OAuth Client ID | тот же `MCP_OAUTH_CLIENT_ID` |
+| OAuth Client Secret | тот же `MCP_OAUTH_CLIENT_SECRET` |
 
-Поля Client ID/Secret могут находиться в дополнительных настройках OAuth.
-Это не MCP_SECRET_TOKEN и не HH_ACCESS_TOKEN. Если форма дополнительно запрашивает
-Authorization URL, укажите `https://ВАШ-TENANT.auth0.com/authorize`; Token URL —
-`https://ВАШ-TENANT.auth0.com/oauth/token`; scopes — `mcp:tools` (для долгой сессии
-также `offline_access`; OIDC `openid email profile` разрешите в клиенте, если
-они запрашиваются из discovery). Обычно эти адреса читаются автоматически.
+Client ID/Secret могут находиться в дополнительных настройках OAuth.
+Не выбирайте «без аутентификации» или «OAuth или без аутентификации».
 
-Создайте подключение, сверьте фактический callback с Auth0, пройдите вход своим
-разрешённым пользователем и подтвердите scope. Если ChatGPT предлагает способ
-регистрации OAuth-клиента, используйте введённые статические client credentials;
-DCR/CIMD для этого рецепта не нужны. После установки выберите HeadHunter в чате.
+Сервер объявляет issuer identification и добавляет `iss` в успешные и ошибочные
+OAuth-редиректы. По актуальной документации для этого режима ChatGPT использует
+стабильный callback:
 
-## 5. Приёмка после разрешённого развёртывания
+```text
+https://chatgpt.com/connector_platform_oauth_redirect
+```
 
-1. GET `/health` без токена → 200, `tools: 19`.
-2. GET `/.well-known/oauth-protected-resource/mcp` → 200; `resource` точно равен
-   HTTPS URL MCP с `/mcp`, `authorization_servers` содержит точный Auth0 issuer.
-3. POST `/mcp` без токена → 401 с `WWW-Authenticate`, содержащим `resource_metadata`.
-4. Подключение ChatGPT проходит вход; список содержит 19 инструментов. Вызовите
-   `search_vacancies` с простым запросом.
-5. Другой пользователь Auth0 не должен получить доступ: 403. Ошибки scope тоже 403;
-   неверный issuer/audience, подпись или истёкший токен — 401.
+Укажите его в `MCP_OAUTH_REDIRECT_URIS`. Затем **обязательно сверьте** с точным
+redirect URI, который показывает страница управления MCP в вашей версии ChatGPT.
+Если показывается иной адрес, скопируйте именно полный фактический HTTPS URL.
+Некоторые подключения используют `https://chatgpt.com/connector/oauth/{callback_id}`:
+не вставляйте фигурные скобки, нужен реальный ID. Несколько адресов можно указать
+через запятую; wildcard, http и fragment запрещены. Путь, query и завершающий `/`
+должны совпадать буквально. Не добавляйте посторонние redirect URI.
 
-До публикации автоматические тесты используют временные ключи и имитацию ответов
-Auth0/hh.ru. Проверяется в том числе реальный HTTP-сервер, initialize, tools/list
-(19 инструментов), tools/call и отсутствие пересылки входящего токена в hh.ru.
-Реальный OAuth-вход в ChatGPT/Auth0 не проверен: tenant и публичный сервис ещё
-не создавались и не развёртывались. Это обязательный финальный этап приёмки,
-а не обещание уже выполненного подключения.
+Адреса обычно читаются автоматически. Если UI дополнительно запрашивает:
 
-При 401 не выбирайте «без аутентификации»: проверьте issuer, audience, ресурсный
-профиль Auth0, exp/iat. При 403 проверьте `sub`, client ID и `mcp:tools`.
-Ключи JWKS кэшируются до 10 минут; при невозможности загрузить нужный ключ запрос
-отклоняется. Logout/revoke refresh token не аннулирует уже выданный JWT немедленно:
-он может действовать до часа. Для срочного отключения пользователя удалите его `sub`
-из allowlist и примените изменение окружения сервиса с отдельным разрешением владельца.
+- Authorization URL: `https://ВАШ-СЕРВИС.onrender.com/oauth/authorize`.
+- Token URL: `https://ВАШ-СЕРВИС.onrender.com/oauth/token`.
+- Scopes: `mcp:tools offline_access`.
+- Token endpoint authentication: `client_secret_post`.
 
-## Проверка зависимостей
+После отдельно разрешённого развёртывания создайте подключение в ChatGPT.
+Откроется страница **вашего Render-домена** «Разрешить доступ к HeadHunter MCP».
+Введите OWNER PASSWORD из менеджера паролей и нажмите «Войти и разрешить доступ».
+После возврата в ChatGPT выберите HeadHunter в чате и проверьте `search_vacancies`.
+Не вводите OWNER PASSWORD в поле Client Secret: это разные секреты.
 
-Обновлены MCP SDK, Zod, JOSE и тестовый раннер. Для сборки нужен Node.js 22.12+
-(на Render задайте 24); CI проверяет 22 и 24. `npm audit --omit=dev` после обновления
-показывает **0 известных уязвимостей** рабочих зависимостей. Полный аудит также
-проверен: остаются **8 предупреждений (7 moderate, 1 low)** в dev-цепочках
-`typescript-eslint → minimatch` и `tsx/vite → esbuild`. High/critical нет.
-Это инструменты разработки/сборки, сервер не запускает их HTTP dev-сервисы.
-Принудительные несовместимые overrides для них не добавлялись; перед будущими
-обновлениями повторите аудит. Отсутствие предупреждений не заменяет проверку
-конфигурации Auth0 и финальный вход через ChatGPT.
+## 5. Сроки, перезапуски и отзыв
 
-## Источники
+- Форма входа: 10 минут; связана с браузером через Secure/HttpOnly/SameSite=Lax
+  cookie и одноразовый CSRF. Каждый вход требует явного нажатия и пароля.
+- Authorization code: 60 секунд, однократный, связан с Client ID, точным redirect,
+  ресурсом и S256 challenge. Выдача токенов и использование кода — одна транзакция.
+- Access token: до 15 минут. На **каждом** запросе проверяется в PostgreSQL.
+- Refresh token: ротация при каждом использовании, абсолютный срок семейства
+  до 7 дней, без продления бесконечным refresh. Нужен scope `offline_access`.
+- Повторное использование уже погашенного code (с правильным PKCE/binding) или
+  refresh token отзывает всё семейство, включая действующие access tokens.
+  При параллельном обновлении одного refresh token потребуется заново войти.
+- Аутентифицированный клиент может отозвать access/refresh token через
+  `POST /oauth/revoke`; это немедленно отзывает всё его семейство.
+- Для срочного общего отзыва создайте новые секреты приватным генератором и
+  примените новые парольный хеш/Client Secret в Render (и Client Secret в ChatGPT).
+  Изменение этих значений, Client ID, origin или списка callbacks делает все старые
+  потоки и токены недействительными. Применение env/перезапуск — после разрешения.
+- Лимиты сохраняются в БД: 30 форм входа/час, 5 вводов пароля/15 минут и
+  60 запросов аутентифицированного клиента к token/revoke за минуту. Лимит входа
+  общий для личного сервиса, не зависит от подделываемого X-Forwarded-For;
+  злоумышленник может временно исчерпать квоту форм (ограничение доступности).
+- Истёкшие данные удаляются при запуске и при разрешённом создании новой формы;
+  использованные code/refresh записи сохраняются до конца семейства для replay detection.
 
-- [ChatGPT custom MCP](https://developers.openai.com/api/docs/guides/custom-mcp-server)
-- [OAuth, PKCE, discovery и актуальные callback URI](https://developers.openai.com/plugins/build/auth)
-- [Auth0: resource parameter и issuer identification](https://auth0.com/ai/docs/mcp/guides/resource-param-compatibility-profile)
-- [Ограничения Render Free](https://render.com/docs/free)
+Render Free засыпает после 15 минут простоя, холодный запуск занимает примерно
+минуту. Перед первым подключением откройте `/health`, дождитесь JSON и повторите
+попытку. После перезапуска браузерный flow, непросроченный code, refresh и признаки
+использования сохраняются в PostgreSQL. При потере/восстановлении БД из старой копии
+смените секреты перед открытием сервиса: откат хранилища может вернуть использованные
+коды/refresh tokens. Не клонируйте OAuth-таблицы в публичные preview-инстансы.
+
+## 6. Проверка после разрешённой публикации
+
+1. `/health` без токена → 200 с `tools: 19`. Это liveness процесса, не проверка
+   соединения с БД; доступ к MCP при отказе БД всё равно закрыт.
+2. `/.well-known/oauth-protected-resource/mcp` → ресурс с `/mcp`, issuer вашего origin.
+3. `/.well-known/oauth-authorization-server` → authorize/token/revoke endpoints,
+   S256, `client_secret_post`, issuer identification. `registration_endpoint` отсутствует.
+4. POST `/mcp` без токена → 401, `WWW-Authenticate` содержит `resource_metadata`.
+5. Вход через ChatGPT → все 19 инструментов; повторить после перезапуска Render.
+6. Чужой пароль не выдаёт код. Подмена callback отклоняется без редиректа на него.
+   Не подменяйте проверку state на стороне ChatGPT: сервер возвращает state без
+   изменения, **клиент** сверяет его со своим исходным значением до обмена кода.
+
+В приложении нет логирования тел, кодов, токенов, пароля или DB URL. Не включайте
+дамп HTTP/SQL параметров и URL query в диагностические логи. Access/refresh токены
+и пароль никогда не передаются в URL; authorization code в callback — часть OAuth,
+защищённая коротким сроком, однократностью, PKCE и секретом клиента.
+Пароль хранится как scrypt-хеш; code/access/refresh/cookie/CSRF — как SHA-256 хеши
+случайных 256-битных значений. Данные hh.ru не сохраняются в OAuth-БД.
+
+Автотесты проверяют SQL-транзакции на PostgreSQL WASM (PGlite), реальный HTTP handler,
+PKCE, state со стороны тестового клиента, replay/race, CSRF, ротацию, отзыв,
+истечение, отказы БД, восстановление on-disk БД и стандартный MCP SDK OAuth client.
+Браузерную проверку можно повторить (нужны Chromium и OpenSSL):
+
+```sh
+# При другом пути к Chromium задайте CHROMIUM_PATH.
+npm run oauth:browser-test
+```
+
+Она использует локальные HTTPS-серверы и тестовый сертификат, не обращается к ChatGPT
+или внешней БД. Форма проверяется в Chromium: успешный вход и отказ cross-site POST. Это **не** уже выполненный
+вход через реальный ChatGPT: публичный Render и внешняя БД ещё не создавались.
+
+Рабочие зависимости проверены `npm audit --omit=dev`: известных уязвимостей нет.
+Полный аудит сохраняет 8 предупреждений dev-цепочек (7 moderate, 1 low:
+`typescript-eslint/minimatch`, `tsx/vite/esbuild`), без high/critical. Они не являются
+открытыми HTTP-сервисами этого приложения. Повторяйте аудит перед обновлением.
+
+## Источники и ограничения бесплатных планов
+
+- [ChatGPT OAuth, PKCE, predefined clients и callback](https://developers.openai.com/plugins/build/auth)
+- [Пользовательские MCP в ChatGPT](https://developers.openai.com/api/docs/guides/custom-mcp-server)
+- [Render Free: сон, потеря локальных файлов и ограничения БД](https://render.com/docs/free)
+- [Neon Free и квоты](https://neon.com/docs/introduction/plans)
+- [TLS node-postgres и параметры connection string](https://node-postgres.com/features/ssl)
+
+Проверка тарифов и доступности регистрации остаётся за владельцем. Не выбирайте
+платный план в расчёте на автоматическое согласие. При недоступности бесплатной
+постоянной БД безопаснее отложить публикацию, чем заменять её памятью Render.

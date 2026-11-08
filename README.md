@@ -92,9 +92,9 @@ HTTP-режим stateless, по умолчанию слушает `127.0.0.1` с
   клиент передаёт `Authorization: Bearer …`. Создайте секрет приватно командой
   `openssl rand -hex 32`. Подходит клиентам с настройкой заголовков.
 - `MCP_AUTH_MODE=oauth`: совместимый с пользовательскими MCP ChatGPT OAuth через
-  Auth0, обязательный allowlist владельца, RS256 JWT и discovery. Статический
-  MCP_SECRET_TOKEN здесь не принимается. Отдельный шлюз или БД не требуются,
-  но нужен настроенный Auth0 tenant.
+  собственную страницу входа владельца, PKCE S256, PostgreSQL и discovery. Статический
+  MCP_SECRET_TOKEN здесь не принимается. Отдельный шлюз не требуется; нужна
+  постоянная PostgreSQL (например, Neon Free), без провайдера входа.
 
 В обоих режимах проверка выполняется до чтения тела и обработки MCP. Запрос без
 правильного токена получает 401. Stdio не требует MCP-аутентификации. `GET /health`
@@ -108,11 +108,11 @@ HTTP-режим stateless, по умолчанию слушает `127.0.0.1` с
 ### Подключение к ChatGPT и Render Free
 
 См. **[пошаговую инструкцию OAuth + Render + ChatGPT](docs/chatgpt-render.md)**:
-настройка Auth0, точные Build/Start Commands, env, Health Check Path и поля формы
+настройка владельца и PostgreSQL, точные Build/Start Commands, env, Health Check Path и поля формы
 «Добавить пользовательский сервер MCP». Выбирайте **OAuth** с заранее
 зарегистрированными Client ID/Secret, а не смешанный или анонимный режим.
-Реальное подключение требует отдельной настройки Auth0 и разрешённого развёртывания;
-до этого проверены только автоматические тесты с имитацией внешних ответов.
+Реальное подключение требует настройки env/постоянной PostgreSQL и разрешённого развёртывания;
+вход через публичный ChatGPT пока не выполнен. SQL/HTTP и форма входа проверяются локально.
 
 ## Переменные окружения
 
@@ -121,9 +121,11 @@ HTTP-режим stateless, по умолчанию слушает `127.0.0.1` с
 | `HH_ACCESS_TOKEN` | нет | Bearer-токен OAuth 2.0. Нужен для эндпоинтов резюме (работодатель + оплаченная база резюме). |
 | `MCP_AUTH_MODE` | нет | `bearer` (по умолчанию) или `oauth`. Режима без защиты нет. |
 | `MCP_PUBLIC_URL` | в oauth | Канонический HTTPS origin сервиса, без `/mcp`. |
-| `MCP_OAUTH_ISSUER` | в oauth | Точный HTTPS issuer Auth0 с завершающим `/`. |
-| `MCP_OAUTH_CLIENT_ID` | в oauth | Разрешённый Client ID приложения ChatGPT в Auth0. |
-| `MCP_OAUTH_ALLOWED_SUBJECTS` | в oauth | Разрешённые User ID (`sub`) Auth0 через запятую. |
+| `MCP_OAUTH_CLIENT_ID` | в oauth | Единственный заранее зарегистрированный Client ID ChatGPT. |
+| `MCP_OAUTH_CLIENT_SECRET` | в oauth | Случайный секрет OAuth-клиента (генератор `npm run oauth:secrets`). |
+| `MCP_ADMIN_PASSWORD_HASH` | в oauth | Scrypt-хеш пароля единственного владельца. |
+| `MCP_OAUTH_REDIRECT_URIS` | в oauth | Точные HTTPS callback URI ChatGPT через запятую, без wildcard. |
+| `MCP_OAUTH_DATABASE_URL` | в oauth | Секретная строка подключения к постоянной PostgreSQL с TLS. |
 | `MCP_SECRET_TOKEN` | в bearer | Отдельный секрет входящего доступа к `/mcp`. Передаётся как `Authorization: Bearer …`. |
 | `HH_USER_AGENT` | нет | Свой `HH-User-Agent` (hh.ru его требует). Рекомендуемый формат: `your-app/1.0 (you@example.com)`. |
 | `HTTP_PORT` / `PORT` | нет | Порт HTTP-режима (по умолчанию 3000). |
