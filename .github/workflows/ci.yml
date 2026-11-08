@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        node-version: [18, 20, 22]
+        node-version: [22, 24]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -19,10 +19,10 @@ jobs:
           node-version: ${{ matrix.node-version }}
           cache: npm
       - run: npm ci
-      # Lint + typecheck are runtime-independent — run once on Node 20.
+      # Lint + typecheck are runtime-independent — run once on Node 22.
       - run: npm run lint
-        if: matrix.node-version == 20
+        if: matrix.node-version == 22
       - run: npm run typecheck
-        if: matrix.node-version == 20
+        if: matrix.node-version == 22
       - run: npm run build
       - run: npm test

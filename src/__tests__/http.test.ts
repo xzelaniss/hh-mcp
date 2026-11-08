@@ -1,6 +1,11 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import http from "node:http";
+import { mkdtemp, writeFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+import { exportJWK, generateKeyPair, SignJWT } from "jose";
 import { once } from "node:events";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
@@ -11,7 +16,7 @@ const children: ChildProcess[] = [];
 let base: string;
 let logs = "";
 
-async function launch(secret: string | undefined, args = ["--http"]) {
+async function launch(secret: string | undefined, args = ["--http"], authEnv: NodeJS.ProcessEnv = {}) {
   const reservation = http.createServer();
   reservation.listen(0, "127.0.0.1");
   await once(reservation, "listening");
@@ -20,11 +25,12 @@ async function launch(secret: string | undefined, args = ["--http"]) {
   await new Promise<void>((resolve) => reservation.close(() => resolve()));
   const env = { ...process.env, HOST: "127.0.0.1", PORT: String(address.port) };
   // Do not inherit production configuration or credentials.
-  for (const key of ["HTTP_PORT", "MCP_SECRET_TOKEN", "HH_ACCESS_TOKEN", "HH_ALLOWED_HOSTS", "HH_ALLOWED_ORIGINS"]) {
+  for (const key of ["HTTP_PORT", "MCP_SECRET_TOKEN", "HH_ACCESS_TOKEN", "HH_ALLOWED_HOSTS", "HH_ALLOWED_ORIGINS", ...Object.keys(process.env).filter((key) => key.startsWith("MCP_"))]) {
     delete env[key as keyof typeof env];
   }
   Object.assign(env, { HH_ACCESS_TOKEN: hhToken });
   if (secret !== undefined) Object.assign(env, { MCP_SECRET_TOKEN: secret });
+  Object.assign(env, authEnv);
   const child = spawn(process.execPath, ["node_modules/tsx/dist/cli.mjs", "src/index.ts", ...args], {
     env, stdio: ["pipe", "pipe", "pipe"],
   });
@@ -61,8 +67,8 @@ afterAll(async () => {
   expect(logs).not.toContain(hhToken);
 });
 
-function request(path = "/mcp", authorization?: string, method = "POST", body = "{") {
-  return fetch(base + path, {
+function request(path = "/mcp", authorization?: string, method = "POST", body = "{", target = base) {
+  return fetch(target + path, {
     method,
     headers: {
       "Content-Type": "application/json",
@@ -73,8 +79,8 @@ function request(path = "/mcp", authorization?: string, method = "POST", body = 
   });
 }
 
-async function rpc(method: string, params: object) {
-  const response = await request("/mcp", `Bearer ${token}`, "POST", JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }));
+async function rpc(method: string, params: object, target = base, credential = token) {
+  const response = await request("/mcp", `Bearer ${credential}`, "POST", JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }), target);
   expect(response.status).toBe(200);
   const text = await response.text();
   return JSON.parse(text.startsWith("event:") ? text.match(/^data: (.+)$/m)![1] : text);
@@ -109,6 +115,17 @@ describe("HTTP authentication", () => {
       req.end("{");
     });
     expect(status).toBe(401);
+  });
+
+  it("rejects malformed request targets without crashing", async () => {
+    const status = await new Promise<number | undefined>((resolve, reject) => {
+      const req = http.request(base, { path: "//[", method: "GET" }, (res) => {
+        res.resume(); resolve(res.statusCode);
+      });
+      req.on("error", reject); req.end();
+    });
+    expect(status).toBe(400);
+    expect((await fetch(base + "/health")).status).toBe(200);
   });
 
   it("leaves health public with all 19 tools", async () => {
@@ -168,5 +185,74 @@ describe("HTTP authentication", () => {
     const { child, output } = await launch(undefined, []);
     expect(child.exitCode).toBeNull();
     expect(output).toContain("Server started (stdio). 19 tools.");
+  });
+});
+
+
+describe("OAuth HTTP discovery", () => {
+  let oauthBase: string;
+  let accessToken: string;
+  let fixtureDir: string;
+  beforeAll(async () => {
+    const { publicKey, privateKey } = await generateKeyPair("RS256");
+    const jwks = { keys: [{ ...await exportJWK(publicKey), kid: "test-key", alg: "RS256", use: "sig" }] };
+    accessToken = await new SignJWT({ scope: "mcp:tools", azp: "test-client" })
+      .setProtectedHeader({ alg: "RS256", kid: "test-key" }).setIssuer("https://tenant.auth0.com/")
+      .setAudience("https://hh.example/mcp").setSubject("auth0|owner").setIssuedAt().setExpirationTime("1h").sign(privateKey);
+    fixtureDir = await mkdtemp(join(tmpdir(), "hh-oauth-test-"));
+    const preload = join(fixtureDir, "fetch-fixture.mjs");
+    // Exercise the real child server and jose verifier. Only network responses
+    // from Auth0 and hh.ru are replaced; no production test bypass is added.
+    await writeFile(preload, `
+      const originalFetch = globalThis.fetch;
+      globalThis.fetch = async (url, options) => {
+        if (String(url) === "https://tenant.auth0.com/.well-known/jwks.json") {
+          return new Response(${JSON.stringify(JSON.stringify(jwks))}, { status: 200 });
+        }
+        if (String(url) === "https://api.hh.ru/me") {
+          if (options.headers.Authorization !== ${JSON.stringify("Bearer " + hhToken)}) {
+            throw new Error("Unexpected outbound credential");
+          }
+          return new Response(JSON.stringify({ id: "test-user", first_name: "Test", is_applicant: true }), { status: 200 });
+        }
+        return originalFetch(url, options);
+      };
+    `);
+
+    oauthBase = (await launch(token, ["--http"], {
+      NODE_OPTIONS: `${process.env.NODE_OPTIONS || ""} --import=${pathToFileURL(preload).href}`,
+      MCP_AUTH_MODE: "oauth", MCP_PUBLIC_URL: "https://hh.example",
+      MCP_OAUTH_ISSUER: "https://tenant.auth0.com/", MCP_OAUTH_CLIENT_ID: "test-client",
+      MCP_OAUTH_ALLOWED_SUBJECTS: "auth0|owner",
+    })).url;
+  });
+  afterAll(async () => { await rm(fixtureDir, { recursive: true, force: true }); });
+  it("supports initialization, all 19 tools and a tool call over OAuth HTTP", async () => {
+    expect((await rpc("initialize", {
+      protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "oauth-test", version: "1" },
+    }, oauthBase, accessToken)).result.serverInfo.name).toBe("hh-mcp");
+    const listed = await rpc("tools/list", {}, oauthBase, accessToken);
+    expect(listed.result.tools).toHaveLength(19);
+    const result = await rpc("tools/call", { name: "validate_token", arguments: {} }, oauthBase, accessToken);
+    expect(result.result.isError).not.toBe(true);
+    expect(result.result.content[0].text).toContain("Токен валиден");
+    expect(logs).not.toContain(accessToken);
+  });
+  it("advertises public discovery but protects MCP, even with the static secret", async () => {
+    for (const path of ["/.well-known/oauth-protected-resource/mcp", "/.well-known/oauth-protected-resource"]) {
+      const response = await fetch(oauthBase + path);
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({
+        resource: "https://hh.example/mcp", authorization_servers: ["https://tenant.auth0.com/"],
+        scopes_supported: ["mcp:tools", "offline_access"], bearer_methods_supported: ["header"],
+      });
+    }
+    for (const method of ["POST", "GET", "DELETE"]) {
+      const response = await fetch(oauthBase + "/mcp", { method });
+      expect(response.status).toBe(401);
+      expect(response.headers.get("www-authenticate")).toContain('resource_metadata="https://hh.example/.well-known/oauth-protected-resource/mcp"');
+    }
+    expect((await fetch(oauthBase + "/mcp", { method: "POST", headers: { Authorization: `Bearer ${token}` }, body: "{" })).status).toBe(401);
+    expect((await fetch(oauthBase + "/health")).status).toBe(200);
   });
 });
