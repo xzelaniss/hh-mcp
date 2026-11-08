@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import http from "node:http";
+import { createHttpAuth } from "./auth.js";
 import type { ZodRawShape } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -287,6 +288,7 @@ async function main() {
   const port = Number(process.env.HTTP_PORT || process.env.PORT || 3000);
 
   if (httpMode) {
+    const auth = createHttpAuth(process.env);
     const host = process.env.HOST || "127.0.0.1";
     // DNS-rebinding protection (off by default in the SDK, CVE-2025-66414):
     // only accept requests whose Host header is in this allow-list.
@@ -302,7 +304,17 @@ async function main() {
       : undefined;
 
     const httpServer = http.createServer(async (req, res) => {
-      const url = new URL(req.url || "/", `http://${req.headers.host || `${host}:${port}`}`);
+      // Do not construct discovery URLs from untrusted Host/Forwarded headers.
+      let url: URL;
+      try {
+        const target = req.url || "/";
+        if (!target.startsWith("/") || target.startsWith("//")) throw new Error();
+        url = new URL(target, "http://localhost");
+      } catch {
+        res.writeHead(400, { "Content-Type": "text/plain" });
+        res.end("Invalid request target");
+        return;
+      }
 
       if (req.method === "GET" && url.pathname === "/health") {
         res.writeHead(200, { "Content-Type": "application/json" });
@@ -310,7 +322,21 @@ async function main() {
         return;
       }
 
+      if (auth.metadata && (url.pathname === auth.metadataPath || url.pathname === "/.well-known/oauth-protected-resource")) {
+        if (req.method !== "GET" && req.method !== "HEAD") {
+          res.writeHead(405, { Allow: "GET, HEAD" });
+          res.end();
+          return;
+        }
+        res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "public, max-age=300" });
+        res.end(req.method === "HEAD" ? undefined : JSON.stringify(auth.metadata));
+        return;
+      }
+
       if (url.pathname === "/mcp") {
+        // Authenticate every method before reading the body, creating an MCP
+        // server/transport, or returning protocol-specific responses.
+        if (!(await auth.authorize(req, res))) return;
         if (req.method !== "POST") {
           res.writeHead(405, { "Content-Type": "application/json", Allow: "POST" });
           res.end(
@@ -339,8 +365,9 @@ async function main() {
           await server.connect(transport);
           const body = await readJsonBody(req);
           await transport.handleRequest(req, res, body);
-        } catch (err) {
-          console.error("[hh-mcp] request error:", err);
+        } catch {
+          // Parser/SDK errors may contain attacker-controlled body fragments.
+          console.error("[hh-mcp] request failed");
           if (!res.headersSent) {
             res.writeHead(500, { "Content-Type": "application/json" });
             res.end(
