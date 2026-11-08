@@ -115,6 +115,44 @@ describe("Self-hosted OAuth HTTP security", () => {
     expect(revoked.status).toBe(200); expect((await mcp(next.access_token)).status).toBe(401);
     expect((await mcp(tokens.access_token)).status).toBe(401);
   });
+  it.each([false, true])("keeps MCP OAuth separate from HH vacancy access (HH token configured: %s)", async (configured) => {
+    const previousToken = process.env.HH_ACCESS_TOKEN;
+    if (configured) process.env.HH_ACCESS_TOKEN = "hh-application-test-token";
+    else delete process.env.HH_ACCESS_TOKEN;
+    const realFetch = globalThis.fetch;
+    let upstreamCalls = 0;
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, options) => {
+      if (String(input).startsWith("https://api.hh.ru/vacancies?")) {
+        upstreamCalls++;
+        const headers = options!.headers as Record<string, string>;
+        expect(headers.Authorization).toBe(configured ? "Bearer hh-application-test-token" : undefined);
+        expect(headers["HH-User-Agent"]).toBeTruthy();
+        return configured
+          ? Response.json({ items: [], found: 0, page: 0, pages: 0, per_page: 1 })
+          : Response.json({ errors: [{ type: "forbidden" }], request_id: "1794177364056354d42f87d2c9641008" }, { status: 403 });
+      }
+      return realFetch(input, options);
+    });
+    try {
+      expect((await mcp()).status).toBe(401); expect(upstreamCalls).toBe(0);
+      const tokens = await (await exchange(await code())).json();
+      const response = await fetch(base + "/mcp", { method: "POST", headers: {
+        Accept: "application/json, text/event-stream", "Content-Type": "application/json", Authorization: `Bearer ${tokens.access_token}`,
+      }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: {
+        name: "search_vacancies", arguments: { text: "python", per_page: 1, page: 0 },
+      } }) });
+      const result = await rpcBody(response); expect(upstreamCalls).toBe(1);
+      if (configured) expect(result.result.isError).not.toBe(true);
+      else {
+        expect(result.result.isError).toBe(true);
+        expect(result.result.structuredContent.error).toMatchObject({ source: "hh_api", http_status: 403, reason: "forbidden", authorization: "anonymous" });
+        expect(result.result.content[0].text).not.toContain("lacks required scope");
+      }
+    } finally {
+      fetchSpy.mockRestore();
+      if (previousToken === undefined) delete process.env.HH_ACCESS_TOKEN; else process.env.HH_ACCESS_TOKEN = previousToken;
+    }
+  });
   it("binds login to a Secure HttpOnly SameSite cookie and sets browser defenses", async () => {
     const f = await flow();
     expect(f.response.headers.get("set-cookie")).toMatch(/__Host-hh_oauth=.*; Secure; HttpOnly; SameSite=Lax; Path=\//);

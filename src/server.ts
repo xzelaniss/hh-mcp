@@ -53,6 +53,7 @@ import { HhApiError } from "./client.js";
 type ToolResult = {
   content: { type: "text"; text: string }[];
   isError?: boolean;
+  structuredContent?: Record<string, unknown>;
 };
 
 function wrapHandler(
@@ -65,7 +66,7 @@ function wrapHandler(
     } catch (error) {
       const message =
         error instanceof HhApiError
-          ? `Error ${error.status}: ${error.message}${error.body ? `\n${error.body}` : ""}`
+          ? `${error.message}${error.diagnostic.request_id ? ` (HH request_id: ${error.diagnostic.request_id})` : ""}`
           : error instanceof Error
             ? error.message
             : String(error);
@@ -73,6 +74,7 @@ function wrapHandler(
       // result so it can self-correct instead of treating it as valid data.
       return {
         isError: true,
+        ...(error instanceof HhApiError ? { structuredContent: { error: error.diagnostic } } : {}),
         content: [{ type: "text" as const, text: `ERROR: ${message}` }],
       };
     }
@@ -93,7 +95,7 @@ const TOOLS: ToolDef[] = [
   {
     name: "search_vacancies",
     description:
-      "Search job vacancies on hh.ru by keywords, region, professional role, industry, metro, salary, experience, employment form, work format, date range and labels. Returns a compact paginated summary (pass raw:true for full JSON).",
+      "Search job vacancies on hh.ru by keywords, region, professional role, industry, metro, salary, experience, employment form, work format, date range and labels. Returns a compact paginated summary (pass raw:true for full JSON). Reliable server-side search needs a legitimate HH application token in HH_ACCESS_TOKEN; anonymous HH requests may be captcha-gated or denied. This is separate from MCP OAuth.",
     schema: searchVacanciesSchema.shape,
     handler: handleSearchVacancies,
   },
@@ -193,7 +195,7 @@ const TOOLS: ToolDef[] = [
   {
     name: "validate_token",
     description:
-      "Check whether HH_ACCESS_TOKEN is valid via /me and report the user role (applicant/employer). Use to diagnose resume-search access.",
+      "Diagnose HH API access from this server: test vacancy search and HH_ACCESS_TOKEN, then report /me user role when available. Application tokens can search vacancies without a /me user. This is separate from MCP OAuth.",
     schema: validateTokenSchema.shape,
     handler: handleValidateToken,
   },

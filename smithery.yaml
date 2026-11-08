@@ -9,7 +9,7 @@ startCommand:
       HH_ACCESS_TOKEN:
         type: string
         title: "hh.ru Access Token"
-        description: "OAuth 2.0 токен для доступа к резюме (опционально). Получить: https://dev.hh.ru/admin"
+        description: "Токен приложения HH для устойчивого поиска вакансий; для резюме нужен токен работодателя и оплаченный доступ. Получить: https://dev.hh.ru/admin"
     required: []
   commandFunction: |-
     (config) => ({

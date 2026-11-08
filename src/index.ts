@@ -42,7 +42,7 @@ async function main() {
     const transport = new StdioServerTransport();
     await server.connect(transport);
     console.error(
-      `[hh-mcp] Server started (stdio). ${TOOL_COUNT} tools. Auth: ${process.env.HH_ACCESS_TOKEN ? "token set" : "no token (public endpoints only)"}`,
+      `[hh-mcp] Server started (stdio). ${TOOL_COUNT} tools. Auth: ${process.env.HH_ACCESS_TOKEN ? "token set" : "no HH token (vacancy search may be restricted)"}`,
     );
   }
 }

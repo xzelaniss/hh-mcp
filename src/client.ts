@@ -1,16 +1,14 @@
 import { VERSION } from "./version.js";
+import { hhDiagnostic } from "./hh-errors.js";
 
 const BASE_URL = "https://api.hh.ru";
 const TIMEOUT = 10_000;
 const MAX_RETRIES = 3;
 
-// hh.ru REQUIRES an `HH-User-Agent` header on every request (it is `required`
-// in the OpenAPI spec) and recommends including a contact address. Requests
-// without it risk being blocked or captcha-gated. The default carries the repo
-// URL as a contact channel; operators can override with their own app + contact
-// email via the HH_USER_AGENT env var (e.g. "my-app/1.0 (me@example.com)").
-const DEFAULT_USER_AGENT = `hh-mcp/${VERSION} (+https://github.com/theYahia/hh-mcp)`;
-const USER_AGENT = process.env.HH_USER_AGENT?.trim() || DEFAULT_USER_AGENT;
+// hh.ru accepts User-Agent or HH-User-Agent; if both are supplied, it uses
+// HH-User-Agent. Operators should set a real app name/version and contact email.
+// The fallback identifies this repository rather than pretending to be a browser.
+const DEFAULT_USER_AGENT = `hh-mcp/${VERSION} (+https://github.com/xzelaniss/hh-mcp)`;
 
 // Rate limiter: 5 requests per second
 const RATE_LIMIT = 5;
@@ -34,17 +32,24 @@ async function waitForRateLimit(): Promise<void> {
 }
 
 export class HhApiError extends Error {
-  constructor(
-    public status: number,
-    public statusText: string,
-    public body?: string,
-  ) {
-    super(`hh.ru HTTP ${status}: ${statusText}`);
+  readonly diagnostic: ReturnType<typeof hhDiagnostic>;
+  readonly body: string;
+  constructor(public status: number, public statusText: string, body?: string, endpoint = "unknown", authenticated = !!process.env.HH_ACCESS_TOKEN?.trim()) {
+    const diagnostic = hhDiagnostic(status, body, endpoint, authenticated);
+    super(`hh.ru API HTTP ${status} [${diagnostic.reason}]: ${diagnostic.action}`);
     this.name = "HhApiError";
+    this.diagnostic = diagnostic;
+    this.body = JSON.stringify({ errors: diagnostic.errors, ...(diagnostic.request_id ? { request_id: diagnostic.request_id } : {}) });
+    // statusText supplied by a remote server is not a trusted error message.
+    this.statusText = `HTTP ${status}`;
   }
 }
 
 export async function hhGet(path: string): Promise<unknown> {
+  const token = process.env.HH_ACCESS_TOKEN?.trim();
+  const userAgent = process.env.HH_USER_AGENT?.trim() || DEFAULT_USER_AGENT;
+  if (token && !/^[A-Za-z0-9\-._~+/]+=*$/.test(token)) throw new Error("HH_ACCESS_TOKEN must contain only the raw HH token, without the Bearer prefix or line breaks.");
+  if (!/^[\x20-\x7E]+$/.test(userAgent)) throw new Error("HH_USER_AGENT must be a single ASCII header value.");
   await waitForRateLimit();
 
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
@@ -54,12 +59,11 @@ export async function hhGet(path: string): Promise<unknown> {
     const headers: Record<string, string> = {
       // hh.ru reads the custom `HH-User-Agent`; we also send the standard
       // `User-Agent` for proxies/CDNs that key on it.
-      "HH-User-Agent": USER_AGENT,
-      "User-Agent": USER_AGENT,
+      "HH-User-Agent": userAgent,
+      "User-Agent": userAgent,
       Accept: "application/json",
     };
 
-    const token = process.env.HH_ACCESS_TOKEN;
     if (token) {
       headers["Authorization"] = `Bearer ${token}`;
     }
@@ -68,6 +72,7 @@ export async function hhGet(path: string): Promise<unknown> {
       const response = await fetch(`${BASE_URL}${path}`, {
         headers,
         signal: controller.signal,
+        redirect: "error",
       });
       clearTimeout(timer);
 
@@ -75,15 +80,10 @@ export async function hhGet(path: string): Promise<unknown> {
 
       const body = await response.text().catch(() => "");
 
-      // Auth errors — fail immediately
+      // A 403 can mean anonymous access restriction, captcha, invalid HH auth,
+      // paid permissions or a generic denial. Do not invent a scope diagnosis.
       if (response.status === 401 || response.status === 403) {
-        throw new HhApiError(
-          response.status,
-          response.status === 401
-            ? "Unauthorized — set HH_ACCESS_TOKEN env var with a valid OAuth2 bearer token"
-            : "Forbidden — token lacks required scope for this endpoint",
-          body,
-        );
+        throw new HhApiError(response.status, response.statusText, body, path, !!token);
       }
 
       // Rate limit — use Retry-After header if available
@@ -99,7 +99,7 @@ export async function hhGet(path: string): Promise<unknown> {
           await new Promise((r) => setTimeout(r, delay));
           continue;
         }
-        throw new HhApiError(429, "Rate limited — all retries exhausted", body);
+        throw new HhApiError(429, "Rate limited — all retries exhausted", body, path, !!token);
       }
 
       // Server errors — retry
@@ -112,7 +112,7 @@ export async function hhGet(path: string): Promise<unknown> {
         continue;
       }
 
-      throw new HhApiError(response.status, response.statusText, body);
+      throw new HhApiError(response.status, response.statusText, body, path, !!token);
     } catch (error) {
       clearTimeout(timer);
       // Abort fires as a DOMException in Node 18+, but be tolerant of runtimes
